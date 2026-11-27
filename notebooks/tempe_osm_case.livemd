@@ -1,0 +1,305 @@
+# Use case: the Tempe crimes on OpenStreetMap streets
+
+## Setup
+
+> Networkex, GeoFrame and Spatex come from Hex. To use a local checkout of Networkex instead (to
+> try changes that are not released yet), set `NETWORKEX_PATH` to it before starting Livebook; a
+> checkout builds its NIF from source, which needs Rust. From the root of the checkout:
+>
+> ```
+> NETWORKEX_PATH=$PWD livebook server notebooks/tempe_osm_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> NETWORKEX_PATH=$PWD elixir scripts/run_livemd.exs notebooks/tempe_osm_case.livemd
+> ```
+>
+> Spanish version: `notebooks/es/caso_tempe_osm.livemd`.
+
+```elixir
+# NETWORKEX_PATH: a local checkout of Networkex to use instead of the Hex package. A checkout
+# builds its NIF from source, which needs Rustler.
+networkex =
+  case System.get_env("NETWORKEX_PATH") do
+    path when path in [nil, ""] -> [{:networkex, "~> 0.3"}]
+    path -> [{:networkex, path: Path.expand(path)}, {:rustler, "~> 0.38", runtime: false}]
+  end
+
+Mix.install(
+  networkex ++
+    [
+      {:geoframe, "~> 0.3.4"},
+      {:spatex, "~> 0.2.1"},
+      {:explorer, "~> 0.13"},
+      {:kino, "~> 0.19"},
+      {:kino_vega_lite, "~> 0.1"},
+      {:req, "~> 0.5"}
+    ]
+)
+```
+
+The data are in `notebooks/data`, next to this notebook in the repository. Opened from anywhere
+else, such as with "Run in Livebook" on HexDocs, the notebook downloads them once from the
+repository on GitHub, at the tag of the installed Networkex version.
+
+```elixir
+# A Shapefile layer is its .shp, .shx, .dbf and .prj files.
+shapefile = fn layer -> for ext <- ~w(shp shx dbf prj), do: "#{layer}.#{ext}" end
+
+data_dir = fn name, files ->
+  local = Path.join([__DIR__, "data", name])
+
+  if File.dir?(local) do
+    local
+  else
+    vsn = Application.spec(:networkex, :vsn)
+    repo = "https://raw.githubusercontent.com/CountlinkX-Solutions/networkex"
+    cache = Path.join([System.tmp_dir!(), "networkex-#{vsn}", name])
+    File.mkdir_p!(cache)
+
+    for file <- files, not File.exists?(Path.join(cache, file)) do
+      url = "#{repo}/v#{vsn}/notebooks/data/#{name}/#{file}"
+      %{body: body} = Req.get!(url, decode_body: false, http_errors: :raise)
+      File.write!(Path.join(cache, file), body)
+    end
+
+    cache
+  end
+end
+```
+
+## Why another street network
+
+The [Tempe use case](tempe_case.livemd) works on the streets distributed with PySAL. They are an
+old, generalised digitisation: 293 lines for the whole sample, drawn tens of meters off today's
+streets, so they do not match a modern basemap. Here the same crimes and schools are analysed on
+the streets of **OpenStreetMap** (OSM) as of October 2026: every way of the main road classes and
+residential streets in a box around the sample (`data/osm_tempe`, © OpenStreetMap contributors,
+ODbL).
+
+Two things change: the network matches the basemap, and it is much more detailed (more streets,
+curves, and the two carriageways of the main roads mapped separately). The crimes and schools are
+the geodanet ones, whose positions were recorded against the old streets, so they are snapped
+again to OSM.
+
+## 1. The two networks
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias Networkex.Network
+
+geodanet = data_dir.("geodanet", Enum.flat_map(~w(streets crimes schools), shapefile))
+osm_dir = data_dir.("osm_tempe", ["tempe_streets.geojson"])
+
+# The geodanet layers carry the CRS of their .prj files, StatePlane Arizona Central (NAD 1983) in
+# US feet. The OSM streets, in longitude/latitude, are reprojected to it.
+read_geodanet = fn name -> geodanet |> Path.join(name) |> GeoFrame.read_file!() end
+
+old_streets = read_geodanet.("streets.shp")
+crimes = read_geodanet.("crimes.shp")
+schools = read_geodanet.("schools.shp")
+crs = GDF.crs(old_streets)
+
+osm = osm_dir |> Path.join("tempe_streets.geojson") |> GeoFrame.read_file!() |> GDF.to_crs(crs)
+
+osm_ntw = Networkex.GeoFrame.network(osm)
+old_ntw = Networkex.GeoFrame.network(old_streets)
+
+summary = fn name, ntw ->
+  %{
+    network: name,
+    vertices: length(ntw.vertices),
+    arcs: length(ntw.arcs),
+    edges: length(ntw.graph.edges),
+    components: ntw.network.n_components,
+    miles: Enum.sum(ntw.arc_lengths) / 5280
+  }
+end
+
+DF.new([summary.("geodanet", old_ntw), summary.("OpenStreetMap", osm_ntw)])
+```
+
+Both networks are connected. The OSM one has ten times more arcs (its ways follow the curves with
+many vertices) and more than twice the length: the box is a little larger than the sample, it has
+more streets, and the main roads are mapped as two carriageways.
+
+The OSM streets over the basemap, by road class:
+
+```elixir
+GeoFrame.Kino.deck(osm, color: {"highway", :categorical}, tooltip: ["name", "highway"])
+```
+
+And the geodanet streets, for comparison:
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(old_ntw, crs: crs), color: {200, 60, 60}, width: 2, tooltip: ["arc"])
+```
+
+## 2. Snapping the crimes again
+
+```elixir
+osm_crimes = Networkex.GeoFrame.snap(osm_ntw, crimes)
+old_crimes = Networkex.GeoFrame.snap(old_ntw, crimes)
+osm_schools = Networkex.GeoFrame.snap(osm_ntw, schools)
+old_schools = Networkex.GeoFrame.snap(old_ntw, schools)
+
+snap_stats = fn name, pp ->
+  s = S.from_list(pp.dist_snapped)
+  %{network: name, mean_snap_ft: S.mean(s), median_snap_ft: S.median(s), max_snap_ft: S.max(s)}
+end
+
+DF.new([snap_stats.("geodanet", old_crimes), snap_stats.("OpenStreetMap", osm_crimes)])
+```
+
+The crimes lie closer to the OSM streets (63 feet on average, half of them within 54 feet) than to
+the geodanet ones (90 and 98 feet): their recorded positions fit the real streets better than the
+old digitisation does.
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.points(osm_crimes, crs: crs),
+  color: {"snap_distance", :viridis},
+  radius: 4,
+  tooltip: ["snap_distance"]
+)
+```
+
+## 3. Distance to the nearest school
+
+```elixir
+nearest_school = fn ntw, crimes_pp, schools_pp ->
+  ntw
+  |> Network.nearest_neighbor_distances(crimes_pp, schools_pp)
+  |> Enum.map(fn {[school | _], d} -> {school, d} end)
+end
+
+osm_near = nearest_school.(osm_ntw, osm_crimes, osm_schools)
+old_near = nearest_school.(old_ntw, old_crimes, old_schools)
+
+compare =
+  DF.new(%{
+    crime: Enum.to_list(0..(length(osm_near) - 1)),
+    osm_ft: Enum.map(osm_near, &elem(&1, 1)),
+    geodanet_ft: Enum.map(old_near, &elem(&1, 1)),
+    same_school: Enum.zip_with(osm_near, old_near, fn {a, _}, {b, _} -> a == b end)
+  })
+
+DF.summarise(compare,
+  mean_osm_ft: mean(osm_ft),
+  mean_geodanet_ft: mean(geodanet_ft),
+  share_same_school: mean(cast(same_school, :integer))
+)
+```
+
+89% of the crimes have the same nearest school on both networks, and the mean distance along the
+streets is about the same (1570 feet on OSM, 1500 on geodanet): the conclusions of the Tempe case
+hold on the real streets.
+
+## 4. Clustering along the OSM streets
+
+The network K-function of the crimes on the OSM network, with 99 simulations of uniformly placed
+crimes on the same streets (the larger network has more room, so the curve is not comparable in
+value with the geodanet one, only in shape):
+
+```elixir
+k = Network.global_auto_k(osm_ntw, osm_crimes, nsteps: 20, permutations: 99, seed: 7, threshold: 0.05)
+
+curves =
+  for {r, obs, lo, hi} <- Enum.zip([k.xaxis, k.observed, k.lower_envelope, k.upper_envelope]),
+      {name, v} <- [observed: obs, lower: lo, upper: hi],
+      do: %{distance_ft: r, curve: Atom.to_string(name), k: v}
+
+VegaLite.new(width: 520, height: 300, title: "Global auto K on the OSM streets")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "distance_ft", type: :quantitative, title: "distance (ft)")
+|> VegaLite.encode_field(:y, "k", type: :quantitative, title: "K(r)")
+|> VegaLite.encode_field(:color, "curve", type: :nominal)
+```
+
+```elixir
+above =
+  Enum.zip([k.xaxis, k.observed, k.upper_envelope])
+  |> Enum.filter(fn {_r, obs, up} -> obs > up end)
+  |> Enum.map(fn {r, _, _} -> round(r) end)
+
+%{distances_above_envelope_ft: above}
+```
+
+The observed curve is above the envelope at every distance: on the real streets too, crimes are
+closer to each other than the same number of random points on those streets.
+
+## 5. Crimes per street segment
+
+OSM arcs are short (a way is drawn with many vertices), so they are first merged back to street
+pieces of at most 500 feet: the OSM graph edges (intersection to intersection) split at 500 feet.
+
+```elixir
+edges_ntw = osm_ntw |> Networkex.GeoFrame.arcs(graph: true, crs: crs) |> Networkex.GeoFrame.network()
+split = Network.split_arcs(edges_ntw, 500)
+split_crimes = Networkex.GeoFrame.snap(split, crimes)
+counts = Network.counts_per_link(split, split_crimes)
+w = Network.contiguity_weights(split)
+graph = Spatex.Graph.from_arrays(w.focal, w.neighbor, w.weight, ids: Enum.to_list(0..(w.n - 1)))
+moran = Spatex.ESDA.moran(counts, graph, permutations: 999, seed: 1)
+
+%{segments: length(split.arcs), with_crimes: Enum.count(counts, &(&1 > 0)), moran_i: moran.i, expected: moran.ei, p_sim: moran.p_sim}
+```
+
+704 pieces, 131 of them with crimes. Moran's I is about 0.02 (expected -0.001, pseudo p-value
+0.13): a slight tendency of busy pieces to touch busy pieces, not significant, as on the geodanet
+network.
+
+The graph edges are straight lines between intersections, which cuts the curves of the streets:
+fine for counting crimes per piece of street, not for measuring along curved roads (sections 3 and
+4 use the full OSM geometry).
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(split, columns: %{"crimes" => counts}, crs: crs),
+  color: {"crimes", :viridis},
+  width: "crimes",
+  tooltip: ["crimes", "length"]
+)
+```
+
+## 6. Routes on the real streets
+
+```elixir
+school_of = Enum.map(osm_near, &elem(&1, 0))
+picked = [0, 50, 100, 150, 200]
+
+one = fn pp, i ->
+  %{
+    pp
+    | points: [Enum.at(pp.points, i)],
+      snapped: [Enum.at(pp.snapped, i)],
+      arcs: [Enum.at(pp.arcs, i)],
+      dist_to_vertex: [Enum.at(pp.dist_to_vertex, i)],
+      dist_snapped: [Enum.at(pp.dist_snapped, i)]
+  }
+end
+
+routes =
+  for i <- picked do
+    school = Enum.at(school_of, i)
+    osm_ntw |> Network.shortest_paths(one.(osm_crimes, i), osm_schools) |> Enum.at(school) |> Map.put(:pair, {i, school})
+  end
+
+paths = Networkex.GeoFrame.paths(routes, crs: crs)
+GeoFrame.Kino.deck(paths, color: {"dest", :categorical}, width: 4, tooltip: ["source", "dest", "length"])
+```
+
+## What we learned
+
+* Current OSM streets match the basemap and the recorded crime positions better than the geodanet
+  streets do.
+* The findings of the Tempe case stand on them: distances to the nearest school of the same
+  order, the same school for 9 crimes in 10, clustering along the streets at every distance, and
+  no significant autocorrelation of counts per street piece.
+* Networkex works the same on any line data: GeoJSON from OpenStreetMap, reprojected with
+  GeoFrame, goes straight into `Networkex.GeoFrame.network/2`.
+
+Map data © OpenStreetMap contributors (ODbL).

@@ -1,0 +1,28 @@
+networkex
+Copyright 2026 Yendris Rogelio Cruz Mendoza
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). networkex includes portions of
+the third-party software below, under their own licenses; the license texts are in the LICENSES
+directory. THIRD_PARTY_NOTICES.md describes this code in detail and lists the Rust crates
+linked into the precompiled NIF libraries and the third-party data in the source repository.
+
+spaghetti
+---------
+networkex is a port of spaghetti (https://github.com/pysal/spaghetti) and follows its
+behaviour. Portions of native/networkex_core (also compiled into the precompiled NIF
+libraries) and of lib/networkex/network.ex are derived from the source code of spaghetti 1.7.6.
+
+Copyright 2017 PySAL-spaghetti Developers
+
+Licensed under the BSD 3-Clause License, reproduced in LICENSES/BSD-3-Clause-spaghetti.txt.
+
+CPython
+-------
+native/networkex_core/src/hypot.rs (also compiled into the precompiled NIF libraries) is a
+modified port of math.hypot from CPython 3.13 (vector_norm in Modules/mathmodule.c);
+THIRD_PARTY_NOTICES.md summarises the changes.
+
+Copyright (c) 2001-2024 Python Software Foundation; All Rights Reserved
+
+Licensed under the Python Software Foundation License Version 2, reproduced in
+LICENSES/PSF-2.0.txt.

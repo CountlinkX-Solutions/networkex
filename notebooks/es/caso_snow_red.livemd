@@ -1,0 +1,328 @@
+# Caso de uso: el mapa del cólera de John Snow sobre las calles del Soho
+
+## Preparación
+
+> Networkex, GeoFrame y Spatex se instalan desde Hex. Para usar en su lugar una copia local de
+> Networkex (y probar cambios aún no publicados), define `NETWORKEX_PATH` con su ruta antes de
+> abrir Livebook; una copia compila su NIF desde el código fuente, lo que requiere Rust. Desde la
+> raíz de la copia:
+>
+> ```
+> NETWORKEX_PATH=$PWD livebook server notebooks/es/caso_snow_red.livemd
+> ```
+>
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+>
+> ```
+> NETWORKEX_PATH=$PWD elixir scripts/run_livemd.exs notebooks/es/caso_snow_red.livemd
+> ```
+>
+> Versión en inglés: `notebooks/snow_network_case.livemd`.
+
+```elixir
+# NETWORKEX_PATH: una copia local de Networkex para usar en lugar del paquete de Hex. Una copia
+# compila su NIF desde el código fuente, lo que requiere Rustler.
+networkex =
+  case System.get_env("NETWORKEX_PATH") do
+    path when path in [nil, ""] -> [{:networkex, "~> 0.3"}]
+    path -> [{:networkex, path: Path.expand(path)}, {:rustler, "~> 0.38", runtime: false}]
+  end
+
+Mix.install(
+  networkex ++
+    [
+      {:geoframe, "~> 0.3.4"},
+      {:spatex, "~> 0.2.1"},
+      {:explorer, "~> 0.13"},
+      {:kino, "~> 0.19"},
+      {:kino_vega_lite, "~> 0.1"},
+      {:req, "~> 0.5"}
+    ]
+)
+```
+
+Los datos están en `notebooks/data`, junto a este cuaderno en el repositorio. Abierto desde
+cualquier otro sitio, como con "Run in Livebook" en HexDocs, el cuaderno los descarga una vez del
+repositorio en GitHub, en la etiqueta de la versión instalada de Networkex.
+
+```elixir
+# Una capa Shapefile son sus ficheros .shp, .shx, .dbf y .prj.
+shapefile = fn layer -> for ext <- ~w(shp shx dbf prj), do: "#{layer}.#{ext}" end
+
+data_dir = fn name, files ->
+  local = Path.join([__DIR__, "..", "data", name])
+
+  if File.dir?(local) do
+    local
+  else
+    vsn = Application.spec(:networkex, :vsn)
+    repo = "https://raw.githubusercontent.com/CountlinkX-Solutions/networkex"
+    cache = Path.join([System.tmp_dir!(), "networkex-#{vsn}", name])
+    File.mkdir_p!(cache)
+
+    for file <- files, not File.exists?(Path.join(cache, file)) do
+      url = "#{repo}/v#{vsn}/notebooks/data/#{name}/#{file}"
+      %{body: body} = Req.get!(url, decode_body: false, http_errors: :raise)
+      File.write!(Path.join(cache, file), body)
+    end
+
+    cache
+  end
+end
+```
+
+## La pregunta
+
+En el brote de cólera del Soho, en Londres, en 1854, John Snow sostuvo que las muertes se agrupaban
+alrededor de una fuente pública, la de Broad Street. Su famoso mapa, y la mayoría de sus
+reanálisis, miden distancias en línea recta. Pero la gente iba a por agua **andando por las
+calles**: una fuente al otro lado de una manzana de casas está más lejos de lo que parece. El propio
+Snow trazó una línea de igual distancia a pie entre la fuente de Broad Street y sus vecinas.
+
+Aquí rehacemos su argumento sobre la red de calles del mapa digitalizado (`snow_maps` de libpysal):
+
+1. ¿Qué fuente está **más cerca a pie** de cada muerte, y cómo se compara con la línea recta?
+2. ¿Se **agrupan las muertes a lo largo de las calles**?
+3. ¿Qué **calles** tuvieron más muertes, y cuáles son las **rutas** a pie hasta Broad Street?
+
+## 1. Las calles, las muertes y las fuentes
+
+Las capas vienen en Web Mercator; GeoFrame las reproyecta a la British National Grid
+(EPSG:27700), en metros.
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Networkex.Network
+
+dir = data_dir.("snow", Enum.flat_map(~w(Soho_Network SohoPeople SohoWater), shapefile))
+read = fn name -> dir |> Path.join(name) |> GeoFrame.read_file!() |> GDF.to_crs("EPSG:27700") end
+
+streets = read.("Soho_Network.shp")
+deaths = read.("SohoPeople.shp")
+pumps = read.("SohoWater.shp")
+crs = GDF.crs(streets)
+
+# Count es el número de muertes en cada dirección; 0 equivale a una (ver el caso de Snow de Spatex).
+deaths_at = deaths |> GDF.pull("Count") |> S.to_list() |> Enum.map(&max(&1, 1))
+
+raw = Networkex.GeoFrame.network(streets)
+
+%{
+  direcciones: GDF.n_rows(deaths),
+  muertes: Enum.sum(deaths_at),
+  fuentes: GDF.n_rows(pumps),
+  componentes_sin_limpiar: raw.network.n_components
+}
+```
+
+### Limpiar las calles digitalizadas
+
+Una red necesita calles que se unan en vértices compartidos. El mapa digitalizado no siempre los
+tiene: algunas calles cruzan otras sin un vértice en el cruce, y otras se quedan a unos metros de la
+calle a la que llegan. Tal como se digitalizó, la red se rompe en 45 piezas, y 93 de las 324
+direcciones no pueden llegar a ninguna fuente por las calles.
+
+GeoFrame arregla ambas cosas con una limpieza topológica habitual: `snap/3` lleva los extremos de
+línea que estén a menos de 5 m de otra calle sobre ella, y `union_all/1` nodifica las líneas (las
+corta donde se cruzan); `explode/1` vuelve a separar el resultado en líneas simples.
+
+```elixir
+geometry = GDF.geometry(streets)
+{clean_lines, _} = geometry |> GS.snap(GS.union_all(geometry), 5) |> GS.union_all() |> GS.explode()
+
+ntw = Networkex.GeoFrame.network(clean_lines)
+
+%{
+  sin_limpiar: %{componentes: raw.network.n_components, km: Enum.sum(raw.arc_lengths) / 1000},
+  limpia: %{componentes: ntw.network.n_components, arcos: length(ntw.arcs), km: Enum.sum(ntw.arc_lengths) / 1000}
+}
+```
+
+Tras la limpieza, las 324 direcciones (583 muertes) y las 13 fuentes quedan en una sola red conexa
+de 348 arcos y 13,9 km, la misma longitud que las calles digitalizadas: la limpieza solo las ha
+unido.
+
+La fuente de Broad Street, por su ubicación histórica (51,5133 N, 0,1367 O):
+
+```elixir
+xy = fn gdf ->
+  c = gdf |> GDF.geometry() |> GS.get_coordinates()
+  Enum.zip(S.to_list(c["x"]), S.to_list(c["y"]))
+end
+
+[historical] =
+  DF.new(name: ["Broad Street pump"])
+  |> GDF.new(GS.from_wkt!(["POINT(-0.13667 51.51334)"], crs: "EPSG:4326"))
+  |> GDF.to_crs("EPSG:27700")
+  |> xy.()
+
+straight = fn {x1, y1}, {x2, y2} -> :math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2) end
+wells = xy.(pumps)
+broad = wells |> Enum.with_index() |> Enum.min_by(fn {w, _} -> straight.(w, historical) end) |> elem(1)
+
+%{fuente_broad_street: broad, metros_a_la_ubicacion_historica: straight.(Enum.at(wells, broad), historical)}
+```
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, crs: crs), color: {90, 90, 90}, width: 2, tooltip: ["arc", "length"])
+```
+
+## 2. La fuente más cercana, a pie
+
+Cada dirección y cada fuente se ajustan a su calle; luego, la distancia a pie de cada dirección a
+cada fuente.
+
+```elixir
+death_pp = Networkex.GeoFrame.snap(ntw, deaths)
+pump_pp = Networkex.GeoFrame.snap(ntw, pumps)
+
+walk = Network.nearest_neighbor_distances(ntw, death_pp, pump_pp)
+walk_pump = Enum.map(walk, fn {[p | _], _} -> p end)
+
+line_pump =
+  for a <- xy.(deaths) do
+    wells |> Enum.with_index() |> Enum.min_by(fn {w, _} -> straight.(a, w) end) |> elem(1)
+  end
+
+share = fn pumps_of ->
+  broad_deaths = Enum.zip(pumps_of, deaths_at) |> Enum.filter(fn {p, _} -> p == broad end) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+  broad_deaths / Enum.sum(deaths_at)
+end
+
+%{
+  muertes_mas_cerca_de_broad_a_pie: share.(walk_pump),
+  muertes_mas_cerca_de_broad_en_linea_recta: share.(line_pump),
+  direcciones_que_cambian_de_fuente: Enum.count(Enum.zip(walk_pump, line_pump), fn {a, b} -> a != b end),
+  paseo_medio_m: walk |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> Kernel./(length(walk))
+}
+```
+
+A pie, el 63 % de las muertes está más cerca de la fuente de Broad Street que de cualquier otra
+(62 % en línea recta). Para 53 de las 324 direcciones la fuente más cercana cambia al medir a pie:
+el trazado de las calles importa dirección a dirección y, en conjunto, refuerza un poco el
+argumento de Snow. El paseo medio hasta la fuente más cercana es de unos 130 m.
+
+```elixir
+deaths = GDF.put(deaths, "fuente_a_pie", S.from_list(Enum.map(walk_pump, &"fuente #{&1}")))
+GeoFrame.Kino.deck(deaths, color: {"fuente_a_pie", :categorical}, radius: 4, tooltip: ["Count", "fuente_a_pie"])
+```
+
+Muertes por la fuente más cercana a pie:
+
+```elixir
+DF.new(fuente: walk_pump, muertes: deaths_at)
+|> DF.group_by("fuente")
+|> DF.summarise(muertes: sum(muertes), direcciones: count(muertes))
+|> DF.sort_by(desc: muertes)
+```
+
+La fuente de Broad Street (número 8) reúne 370 de las 583 muertes; la siguiente, 72.
+
+## 3. ¿Agrupadas a lo largo de las calles?
+
+La función K en la red de las direcciones con muertes, frente a 99 patrones aleatorios de tantas
+direcciones por las mismas calles:
+
+```elixir
+k = Network.global_auto_k(ntw, death_pp, nsteps: 20, permutations: 99, seed: 3, threshold: 0.05)
+
+curves =
+  for {r, obs, lo, hi} <- Enum.zip([k.xaxis, k.observed, k.lower_envelope, k.upper_envelope]),
+      {name, v} <- [observada: obs, inferior: lo, superior: hi],
+      do: %{distancia_m: r, curva: Atom.to_string(name), k: v}
+
+VegaLite.new(width: 520, height: 300, title: "Función K en la red de las direcciones con muertes")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "distancia_m", type: :quantitative, title: "distancia a pie (m)")
+|> VegaLite.encode_field(:y, "k", type: :quantitative, title: "K(r)")
+|> VegaLite.encode_field(:color, "curva", type: :nominal)
+```
+
+```elixir
+above =
+  Enum.zip([k.xaxis, k.observed, k.upper_envelope])
+  |> Enum.filter(fn {_r, obs, up} -> obs > up end)
+  |> Enum.map(fn {r, _, _} -> round(r) end)
+
+%{distancias_sobre_la_envolvente_m: above}
+```
+
+La curva observada está por encima de la envolvente a todas las distancias a pie hasta casi 900 m:
+las muertes están mucho más concentradas a lo largo de las calles que direcciones repartidas al
+azar por las mismas calles.
+
+## 4. Muertes por calle
+
+Muertes por tramo de calle (de 50 m como mucho), ponderadas por las muertes de cada dirección, y la
+I de Moran de esos recuentos con la contigüidad de la red:
+
+```elixir
+split = Network.split_arcs(ntw, 50)
+split_pp = Networkex.GeoFrame.snap(split, deaths)
+index = split.arcs |> Enum.with_index() |> Map.new()
+
+per_piece =
+  Enum.zip(split_pp.arcs, deaths_at)
+  |> Enum.reduce(List.duplicate(0, length(split.arcs)), fn {arc, d}, acc -> List.update_at(acc, index[arc], &(&1 + d)) end)
+
+w = Network.contiguity_weights(split)
+graph = Spatex.Graph.from_arrays(w.focal, w.neighbor, w.weight, ids: Enum.to_list(0..(w.n - 1)))
+moran = Spatex.ESDA.moran(per_piece, graph, permutations: 999, seed: 1)
+
+%{tramos: length(split.arcs), con_muertes: Enum.count(per_piece, &(&1 > 0)), i_de_moran: moran.i, esperada: moran.ei, p_sim: moran.p_sim}
+```
+
+120 de los 479 tramos tuvieron muertes. La I de Moran es 0,33 (esperada -0,002, pseudo p-valor
+0,001): las calles con muchas muertes son vecinas de calles con muchas muertes, un grupo de calles
+alrededor de la fuente y no casos dispersos.
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(split, columns: %{"muertes" => per_piece}, crs: crs),
+  color: {"muertes", :viridis},
+  width: "muertes",
+  tooltip: ["muertes"]
+)
+```
+
+## 5. A pie hasta Broad Street
+
+Las rutas desde las diez direcciones con más muertes hasta la fuente de Broad Street:
+
+```elixir
+top = deaths_at |> Enum.with_index() |> Enum.sort_by(fn {d, _} -> -d end) |> Enum.take(10) |> Enum.map(&elem(&1, 1))
+
+pick = fn pp, idx ->
+  take = fn list -> Enum.map(idx, &Enum.at(list, &1)) end
+  %{pp | points: take.(pp.points), snapped: take.(pp.snapped), arcs: take.(pp.arcs), dist_to_vertex: take.(pp.dist_to_vertex), dist_snapped: take.(pp.dist_snapped)}
+end
+
+routes =
+  ntw
+  |> Network.shortest_paths(pick.(death_pp, top), pick.(pump_pp, [broad]))
+  |> Enum.map(fn %{pair: {i, _}} = p -> %{p | pair: {Enum.at(top, i), broad}} end)
+
+paths = Networkex.GeoFrame.paths(routes, crs: crs)
+
+DF.new(%{direccion: Enum.map(routes, &elem(&1.pair, 0)), muertes: Enum.map(top, &Enum.at(deaths_at, &1)), paseo_m: S.to_list(GDF.pull(paths, "length"))})
+```
+
+```elixir
+GeoFrame.Kino.deck(paths, color: {200, 40, 40}, width: 4, tooltip: ["source", "length"])
+```
+
+Las direcciones más castigadas están a entre 14 y 250 m de la fuente a pie.
+
+## Qué hemos aprendido
+
+* Las calles digitalizadas necesitan una limpieza topológica (llevar los extremos a menos de 5 m y
+  nodificar los cruces) antes de formar una red; GeoFrame la hace en tres llamadas, sin cambiar su
+  longitud.
+* Medido a pie, el 63 % de las muertes está más cerca de la fuente de Broad Street, algo más que en
+  línea recta, y la distancia a pie cambia la fuente más cercana de una de cada seis direcciones.
+* Las muertes se agrupan a lo largo de las calles (función K en la red) y se concentran en calles
+  vecinas (I de Moran 0,33): la conclusión de Snow, sobre por dónde se iba a por agua, se sostiene
+  en la red de calles.

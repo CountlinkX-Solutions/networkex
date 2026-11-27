@@ -1,0 +1,317 @@
+# Caso de uso: delitos en las calles de Tempe, Arizona
+
+## Preparación
+
+> Networkex, GeoFrame y Spatex se instalan desde Hex. Para usar en su lugar una copia local de
+> Networkex (y probar cambios aún no publicados), define `NETWORKEX_PATH` con su ruta antes de
+> abrir Livebook; una copia compila su NIF desde el código fuente, lo que requiere Rust. Desde la
+> raíz de la copia:
+>
+> ```
+> NETWORKEX_PATH=$PWD livebook server notebooks/es/caso_tempe.livemd
+> ```
+>
+> o sin interfaz, para comprobar que todas las celdas funcionan:
+>
+> ```
+> NETWORKEX_PATH=$PWD elixir scripts/run_livemd.exs notebooks/es/caso_tempe.livemd
+> ```
+>
+> Versión en inglés: `notebooks/tempe_case.livemd`.
+
+```elixir
+# NETWORKEX_PATH: una copia local de Networkex para usar en lugar del paquete de Hex. Una copia
+# compila su NIF desde el código fuente, lo que requiere Rustler.
+networkex =
+  case System.get_env("NETWORKEX_PATH") do
+    path when path in [nil, ""] -> [{:networkex, "~> 0.3"}]
+    path -> [{:networkex, path: Path.expand(path)}, {:rustler, "~> 0.38", runtime: false}]
+  end
+
+Mix.install(
+  networkex ++
+    [
+      {:geoframe, "~> 0.3.4"},
+      {:spatex, "~> 0.2.1"},
+      {:explorer, "~> 0.13"},
+      {:kino, "~> 0.19"},
+      {:kino_vega_lite, "~> 0.1"},
+      {:req, "~> 0.5"}
+    ]
+)
+```
+
+Los datos están en `notebooks/data`, junto a este cuaderno en el repositorio. Abierto desde
+cualquier otro sitio, como con "Run in Livebook" en HexDocs, el cuaderno los descarga una vez del
+repositorio en GitHub, en la etiqueta de la versión instalada de Networkex.
+
+```elixir
+# Una capa Shapefile son sus ficheros .shp, .shx, .dbf y .prj.
+shapefile = fn layer -> for ext <- ~w(shp shx dbf prj), do: "#{layer}.#{ext}" end
+
+data_dir = fn name, files ->
+  local = Path.join([__DIR__, "..", "data", name])
+
+  if File.dir?(local) do
+    local
+  else
+    vsn = Application.spec(:networkex, :vsn)
+    repo = "https://raw.githubusercontent.com/CountlinkX-Solutions/networkex"
+    cache = Path.join([System.tmp_dir!(), "networkex-#{vsn}", name])
+    File.mkdir_p!(cache)
+
+    for file <- files, not File.exists?(Path.join(cache, file)) do
+      url = "#{repo}/v#{vsn}/notebooks/data/#{name}/#{file}"
+      %{body: body} = Req.get!(url, decode_body: false, http_errors: :raise)
+      File.write!(Path.join(cache, file), body)
+    end
+
+    cache
+  end
+end
+```
+
+## La pregunta
+
+Los delitos ocurren en las calles. Un mapa de incidentes lleva a las preguntas de siempre (¿se
+agrupan?, ¿a qué distancia están de las escuelas?), pero medir "en línea recta" ignora que las
+personas, los coches y las patrullas se mueven por la red de calles: dos incidentes a ambos lados
+de una manzana pueden estar lejos para quien va a pie. El análisis de redes mide a lo largo de las
+calles.
+
+Los datos son la muestra de Tempe, Arizona, de los tutoriales de spaghetti (distribuida con
+PySAL): 293 líneas de calles, 287 delitos y 8 escuelas, en StatePlane Arizona Central (pies de
+EE. UU.). Nos preguntamos:
+
+1. ¿Cómo es la **red** de calles (tramos, cruces, conectividad)?
+2. ¿A qué distancia está cada delito de la **escuela más cercana**, por las calles?
+3. ¿Se **agrupan los delitos a lo largo de la red** más de lo que explicarían las calles?
+4. ¿Las calles con muchos delitos son vecinas de calles con muchos delitos (**autocorrelación
+   espacial**)?
+5. ¿Qué **rutas** llevan de los delitos a su escuela más cercana?
+
+## 1. La red de calles
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias Networkex.Network
+
+dir = data_dir.("geodanet", Enum.flat_map(~w(streets crimes schools), shapefile))
+
+# Las capas llevan el CRS de sus .prj, StatePlane Arizona Central (NAD 1983) en pies de EE. UU.,
+# así que todas las distancias se miden en pies de EE. UU.
+read = fn name -> dir |> Path.join(name) |> GeoFrame.read_file!() end
+
+streets = read.("streets.shp")
+crimes = read.("crimes.shp")
+schools = read.("schools.shp")
+crs = GDF.crs(streets)
+
+{GDF.n_rows(streets), GDF.n_rows(crimes), GDF.n_rows(schools)}
+```
+
+`Networkex.GeoFrame.network/2` convierte cada línea en **arcos** entre vértices consecutivos y une
+las líneas que se encuentran en el mismo punto (redondeado). El **grafo** fusiona cada cadena de
+vértices de grado 2 en una sola **arista**, de cruce a cruce.
+
+```elixir
+ntw = Networkex.GeoFrame.network(streets)
+
+%{
+  vertices: length(ntw.vertices),
+  arcos: length(ntw.arcs),
+  aristas_del_grafo: length(ntw.graph.edges),
+  componentes: ntw.network.n_components,
+  longitud_total_millas: Enum.sum(ntw.arc_lengths) / 5280
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, crs: crs),
+  color: {"length", :viridis},
+  tooltip: ["arc", "length"]
+)
+```
+
+## 2. Delitos y escuelas sobre la red
+
+Cada observación se **ajusta** (snap) al punto más cercano de su tramo de calle más cercano. La
+distancia de ajuste dice a qué distancia de la calle está la ubicación registrada.
+
+```elixir
+crime_pp = Networkex.GeoFrame.snap(ntw, crimes)
+school_pp = Networkex.GeoFrame.snap(ntw, schools)
+
+snap = S.from_list(crime_pp.dist_snapped)
+%{ajuste_maximo_pies: S.max(snap), ajuste_medio_pies: S.mean(snap)}
+```
+
+La distancia por la red de cada delito a su escuela más cercana, junto a la distancia en línea
+recta: el cociente dice cuánto más largo es el trayecto por las calles.
+
+```elixir
+nearest = Network.nearest_neighbor_distances(ntw, crime_pp, school_pp)
+
+straight = fn {x1, y1}, {x2, y2} -> :math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) end
+
+table =
+  Enum.zip(crime_pp.snapped, nearest)
+  |> Enum.with_index()
+  |> Enum.map(fn {{p, {[school | _], network_ft}}, i} ->
+    euclid = straight.(p, Enum.at(school_pp.snapped, school))
+    %{delito: i, escuela: school, red_pies: network_ft, recta_pies: euclid, cociente: network_ft / euclid}
+  end)
+  |> DF.new()
+
+DF.summarise(table, media_red_pies: mean(red_pies), cociente_medio: mean(cociente), cociente_maximo: max(cociente))
+```
+
+```elixir
+school_of = table |> DF.pull("escuela") |> S.to_list()
+
+GeoFrame.Kino.deck(Networkex.GeoFrame.points(crime_pp, columns: %{"escuela_mas_cercana" => school_of}, crs: crs),
+  color: {"escuela_mas_cercana", :categorical},
+  radius: 4,
+  tooltip: ["escuela_mas_cercana", "snap_distance"]
+)
+```
+
+## 3. ¿Se agrupan los delitos a lo largo de las calles?
+
+La **función K** global cuenta, para distancias `r` crecientes, cuántos pares de delitos están a
+menos de `r` por la red, en relación con la intensidad de delitos. Se compara con la misma curva
+para patrones aleatorios de tantos puntos repartidos uniformemente por las calles: si la curva
+observada supera la envolvente de las simulaciones, los delitos están más cerca entre sí de lo que
+explica solo el trazado de las calles.
+
+```elixir
+k = Network.global_auto_k(ntw, crime_pp, nsteps: 20, permutations: 99, seed: 7, threshold: 0.05)
+
+curves =
+  for {r, obs, lo, hi} <- Enum.zip([k.xaxis, k.observed, k.lower_envelope, k.upper_envelope]),
+      {name, v} <- [observada: obs, inferior: lo, superior: hi],
+      do: %{distancia_pies: r, curva: Atom.to_string(name), k: v}
+
+VegaLite.new(width: 520, height: 300, title: "Función K global por la red")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "distancia_pies", type: :quantitative, title: "distancia (pies)")
+|> VegaLite.encode_field(:y, "k", type: :quantitative, title: "K(r)")
+|> VegaLite.encode_field(:color, "curva", type: :nominal)
+```
+
+```elixir
+above =
+  Enum.zip([k.xaxis, k.observed, k.upper_envelope])
+  |> Enum.filter(fn {_r, obs, up} -> obs > up end)
+  |> Enum.map(fn {r, _, _} -> round(r) end)
+
+%{distancias_sobre_la_envolvente_pies: above}
+```
+
+La envolvente de spaghetti escala los valores simulados extremos (por `1 - threshold / 2` y
+`threshold / 2`); `threshold: 0.05` los deja casi como son. La curva observada está por encima de
+la envolvente desde unos 500 pies hasta algo más de 3000, y de nuevo desde unos 6400: los delitos
+están más cerca entre sí por las calles que 287 puntos aleatorios sobre las mismas calles, a
+escala de manzana y a escala de toda la zona.
+
+## 4. Delitos por calle y autocorrelación espacial
+
+Contar los delitos por arco da un valor por tramo de calle. Dos tramos son vecinos si comparten un
+vértice. La I de Moran (de Spatex, con los pesos de contigüidad de Networkex) pregunta entonces si
+los tramos con muchos delitos están juntos.
+
+```elixir
+counts = Network.counts_per_link(ntw, crime_pp)
+w = Network.contiguity_weights(ntw)
+graph = Spatex.Graph.from_arrays(w.focal, w.neighbor, w.weight, ids: Enum.to_list(0..(w.n - 1)))
+moran = Spatex.ESDA.moran(counts, graph, permutations: 999, seed: 1)
+
+%{i_de_moran: moran.i, esperada: moran.ei, p_sim: moran.p_sim}
+```
+
+La I de Moran es de unos 0,005, frente a una esperada de -0,003, con un pseudo p-valor de
+alrededor de 0,3: no hay evidencia de que los tramos con muchos delitos sean vecinos de tramos con
+muchos delitos. La agrupación que encuentra la función K se debe a que los delitos están cerca unos
+de otros, no a que destaquen grupos enteros de calles vecinas.
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, columns: %{"delitos" => counts}, crs: crs),
+  color: {"delitos", :viridis},
+  width: "delitos",
+  tooltip: ["arc", "delitos", "length"]
+)
+```
+
+Los arcos son tan largos como los tramos digitalizados, así que un arco largo acumula más delitos
+solo por su longitud. Dividir la red en piezas de como mucho 500 pies hace comparables las
+unidades; los delitos se ajustan de nuevo a la red dividida.
+
+```elixir
+split = Network.split_arcs(ntw, 500)
+split_pp = Networkex.GeoFrame.snap(split, crimes)
+split_counts = Network.counts_per_link(split, split_pp)
+sw = Network.contiguity_weights(split)
+
+split_moran =
+  Spatex.ESDA.moran(
+    split_counts,
+    Spatex.Graph.from_arrays(sw.focal, sw.neighbor, sw.weight, ids: Enum.to_list(0..(sw.n - 1))),
+    permutations: 999,
+    seed: 1
+  )
+
+%{arcos: length(split.arcs), i_de_moran: split_moran.i, p_sim: split_moran.p_sim}
+```
+
+## 5. Rutas a la escuela más cercana
+
+El camino más corto de algunos delitos a su escuela más cercana, por las calles:
+
+```elixir
+picked = [0, 50, 100, 150, 200]
+
+routes =
+  for i <- picked do
+    one = %{
+      crime_pp
+      | points: [Enum.at(crime_pp.points, i)],
+        snapped: [Enum.at(crime_pp.snapped, i)],
+        arcs: [Enum.at(crime_pp.arcs, i)],
+        dist_to_vertex: [Enum.at(crime_pp.dist_to_vertex, i)],
+        dist_snapped: [Enum.at(crime_pp.dist_snapped, i)]
+    }
+
+    school = Enum.at(school_of, i)
+    Network.shortest_paths(ntw, one, school_pp) |> Enum.at(school) |> Map.put(:pair, {i, school})
+  end
+
+paths = Networkex.GeoFrame.paths(routes, crs: crs)
+DF.new(%{delito: Enum.map(routes, &elem(&1.pair, 0)), escuela: Enum.map(routes, &elem(&1.pair, 1)), longitud_pies: S.to_list(GDF.pull(paths, "length"))})
+```
+
+```elixir
+GeoFrame.Kino.deck(paths, color: {"dest", :categorical}, width: 4, tooltip: ["source", "dest", "length"])
+```
+
+Las longitudes de los caminos coinciden con las distancias por la red de la sección 2 hasta una
+millonésima de punto porcentual (las longitudes de los arcos van de cada vértice redondeado al
+vértice siguiente tal como se digitalizó, los caminos unen los vértices redondeados): el camino es
+la ruta que miden esas distancias.
+
+## Qué hemos aprendido
+
+* Las 293 líneas de calles forman una sola red conexa de 230 vértices y 303 arcos (179 aristas
+  entre cruces), unas 19,8 millas de calles.
+* Las ubicaciones registradas de los delitos están de media a 90 pies de la calle (como mucho a
+  326). Por las calles, la escuela más cercana está de media a 1500 pies, un tercio más que en línea
+  recta, y hasta 2,6 veces la distancia recta.
+* La función K por la red muestra delitos agrupados a lo largo de las calles más allá de lo que
+  explica el trazado, tanto a distancias cortas como en toda la zona.
+* Los recuentos por tramo no muestran autocorrelación espacial por contigüidad en la red (I de
+  Moran cerca de su esperanza), tampoco con los tramos divididos a 500 pies como mucho.
+
+Todas las funciones de Networkex usadas aquí están verificadas contra spaghetti (ver la guía de
+paridad).

@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose new functionality or a change to existing behaviour.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What you want to do with Networkex and why the current API does not cover it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The function, option or behaviour you have in mind, with an example of how it would be called.
+    validations:
+      required: true
+  - type: textarea
+    id: reference
+    attributes:
+      label: Reference implementation or literature
+      description: The spaghetti (or other PySAL) function it corresponds to, or the method's publication, if any.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use today or other designs you considered.

@@ -1,0 +1,234 @@
+name: Release
+
+# Builds the precompiled NIFs that Networkex.Native downloads (6 targets x 2 NIF versions) and,
+# for a pushed version tag, attaches them to that tag's GitHub release. RELEASING.md describes the
+# whole release, including the checksum file that the Hex package needs from these artifacts.
+on:
+  push:
+    tags: ["v*"]
+  # A manual run builds every artifact without publishing anything, even when run on a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: NIF ${{ matrix.nif }} / ${{ matrix.job.target }}
+    runs-on: ${{ matrix.job.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Must match `nif_versions` and `targets` in lib/networkex/native.ex.
+        nif: ["2.16", "2.17"]
+        # Leave `use-cross` out rather than setting it to false: the action receives inputs as
+        # strings, and the non-empty string "false" would still make it install cross.
+        # Both Linux glibc targets build in cross's images (Ubuntu 16.04, glibc 2.23), so they
+        # need the same, old glibc; the runner's own glibc (2.35) would raise the floor.
+        job:
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-22.04, use-cross: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-2022 }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Read the package version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^  @version "\([^"]*\)".*/\1/p' mix.exs)
+          if [ -z "$version" ]; then
+            echo "::error file=mix.exs::Could not read @version"
+            exit 1
+          fi
+          echo "PROJECT_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Networkex.Native downloads from the release named after the package version.
+      - name: Check that the tag matches the package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$TAG" != "v$PROJECT_VERSION" ]; then
+            echo "::error::Tag $TAG does not match mix.exs version $PROJECT_VERSION"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+
+      # The crate is a workspace member, so the build runs from the workspace root (where
+      # `target/` and `.cargo/config.toml` live) and selects the NIF crate with `-p`. The action
+      # adds `--features nif_version_X_Y` for the NIF version.
+      - name: Build the NIF
+        id: build-crate
+        uses: philss/rustler-precompiled-action@v1.1.5
+        with:
+          project-name: networkex_native
+          project-version: ${{ env.PROJECT_VERSION }}
+          target: ${{ matrix.job.target }}
+          nif-version: ${{ matrix.nif }}
+          use-cross: ${{ matrix.job.use-cross }}
+          cross-version: v0.2.5
+          project-dir: "./"
+          cargo-args: "-p networkex_native --locked"
+
+      # The highest GLIBC_ symbol version a library needs is the oldest glibc it loads on. README.md
+      # promises the ceiling below: raise it only on purpose, and update README.md and RELEASING.md.
+      - name: Check the glibc the NIF needs
+        if: endsWith(matrix.job.target, '-linux-gnu')
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.build-crate.outputs.file-path }}
+          GLIBC_CEILING: "2.28"
+        run: |
+          dir=$(mktemp -d)
+          tar -xzf "$ARTIFACT" -C "$dir"
+          lib=$(find "$dir" -name '*.so' -print -quit)
+          if [ -z "$lib" ]; then
+            echo "::error::No .so file in $ARTIFACT"
+            exit 1
+          fi
+          # readelf reads an ELF file of any architecture, so it checks the aarch64 build too.
+          highest=$(readelf --version-info --wide "$lib" | grep -o 'GLIBC_[0-9][0-9.]*' |
+            sed 's/^GLIBC_//' | sort -uV | tail -n 1)
+          name=$(basename "$lib")
+          if [ -z "$highest" ]; then
+            echo "::error::No GLIBC_ symbol versions found in $name"
+            exit 1
+          fi
+          echo "$name needs glibc $highest or newer (ceiling $GLIBC_CEILING)"
+          if [ "$(printf '%s\n' "$highest" "$GLIBC_CEILING" | sort -V | tail -n 1)" != "$GLIBC_CEILING" ]; then
+            echo "::error::$name needs glibc $highest, above the ceiling $GLIBC_CEILING"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build-crate.outputs.file-name }}
+          path: ${{ steps.build-crate.outputs.file-path }}
+          if-no-files-found: error
+
+  # The only job that can write to the repository, and it runs no build code. It runs only for a
+  # pushed tag and only when every build succeeded, so a release never carries a partial set of
+  # NIFs.
+  release:
+    name: Attach NIFs to the release
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One release job per tag at a time, so two runs for the same tag cannot both find no
+    # release and create two drafts. A run in progress is never cancelled.
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ github.ref_name }}
+      # The NIFs the build matrix makes (`nif` x `job[].target`): a test in
+      # test/networkex/publish_guard_test.exs keeps these lists, the matrix and mix.exs equal.
+      NIF_VERSIONS: "2.16 2.17"
+      NIF_TARGETS: >-
+        aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu
+        x86_64-unknown-linux-gnu x86_64-unknown-linux-musl x86_64-pc-windows-msvc
+    steps:
+      # Only for the license files attached beside the NIFs.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: "*networkex_native-v*.tar.gz"
+          merge-multiple: true
+
+      # The names Networkex.Native downloads, for the version of the tag (the build jobs checked
+      # that it is the mix.exs version).
+      - name: Check the artifact names
+        run: |
+          ls -l artifacts
+          version=${TAG#v}
+          expected=$(
+            for nif in $NIF_VERSIONS; do
+              for target in $NIF_TARGETS; do
+                case $target in
+                  *windows*) echo "networkex_native-v$version-nif-$nif-$target.dll.tar.gz" ;;
+                  *) echo "libnetworkex_native-v$version-nif-$nif-$target.so.tar.gz" ;;
+                esac
+              done
+            done | sort
+          )
+          actual=$(find artifacts -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
+          missing=$(comm -23 <(echo "$expected") <(echo "$actual"))
+          unexpected=$(comm -13 <(echo "$expected") <(echo "$actual"))
+          if [ -n "$missing$unexpected" ]; then
+            echo "::error::The artifacts are not the $(wc -l <<< "$expected") NIFs of $TAG"
+            for name in $missing; do echo "missing: $name"; done
+            for name in $unexpected; do echo "unexpected: $name"; done
+            exit 1
+          fi
+
+      # The release is created as a draft, filled, then published: a published release may be
+      # immutable, and users never see it half-filled. Published assets are never replaced,
+      # because the checksums on Hex pin their bytes, and nothing is uploaded into a published
+      # release.
+      - name: Upload the NIFs to a draft release and publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -u
+          # The NIF tarballs keep the names Networkex.Native downloads. The license texts that
+          # cover the binaries are separate assets, under their basenames: PSF-2.0.txt and
+          # BSD-3-Clause-spaghetti.txt come from LICENSES/ (see THIRD_PARTY_NOTICES.md).
+          assets=(artifacts/*.tar.gz LICENSE NOTICE THIRD_PARTY_NOTICES.md
+                  LICENSES/PSF-2.0.txt LICENSES/BSD-3-Clause-spaghetti.txt)
+
+          # Only "release not found" means there is no release yet. Any other failure (token,
+          # rate limit, network) stops here, so a release that exists never gets a second draft.
+          # Release assets have no directories: NOTICE and THIRD_PARTY_NOTICES.md name the
+          # license texts by their LICENSES/ paths.
+          LICENSE_NOTE="PSF-2.0.txt and BSD-3-Clause-spaghetti.txt are the files LICENSES/PSF-2.0.txt and LICENSES/BSD-3-Clause-spaghetti.txt that NOTICE and THIRD_PARTY_NOTICES.md refer to."
+
+          view_error=$(mktemp)
+          if is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2> "$view_error"); then
+            :
+          elif grep -qx 'release not found' "$view_error"; then
+            gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+              --notes "See [CHANGELOG.md]($GITHUB_SERVER_URL/$GH_REPO/blob/$TAG/CHANGELOG.md). $LICENSE_NOTE"
+            is_draft=$(gh release view "$TAG" --json isDraft --jq '.isDraft')
+          else
+            cat "$view_error" >&2
+            echo "::error::Could not read release $TAG; nothing was changed. Re-run the job once gh works."
+            exit 1
+          fi
+
+          existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+
+          if [ "$is_draft" != "true" ]; then
+            if [ -n "$existing" ]; then
+              echo "::error::Release $TAG is already published with assets; they are never replaced, because the checksums on Hex may pin them. See RELEASING.md."
+            else
+              echo "::error::Release $TAG is published without assets. Nothing is uploaded into a published release (it may be immutable): delete the release, keeping the tag, or convert it to a draft, then re-run this job. See RELEASING.md."
+            fi
+            exit 1
+          fi
+
+          # Nobody could download a draft's assets, so those left by an earlier run are replaced.
+          for asset in "${assets[@]}"; do
+            name=$(basename "$asset")
+            if grep -qxF "$name" <<< "$existing"; then
+              gh release delete-asset "$TAG" "$name" --yes
+            fi
+          done
+
+          gh release upload "$TAG" "${assets[@]}"
+          gh release edit "$TAG" --draft=false

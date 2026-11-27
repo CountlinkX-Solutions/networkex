@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  # Any base branch, so stacked PRs (feature-branch chains) get CI too.
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run still going for it. Every other run has a group
+# of its own, so runs on main are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+  # CI always tests the NIF built from this checkout, never a precompiled one.
+  NETWORKEX_BUILD: "1"
+
+jobs:
+  elixir:
+    name: Elixir ${{ matrix.elixir }} / OTP ${{ matrix.otp }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, elixir: "1.17", otp: "27" }
+          # Style is enforced on the newest pair only; older formatters disagree.
+          - { os: ubuntu-latest, elixir: "1.19", otp: "28", lint: true }
+          - { os: macos-latest, elixir: "1.19", otp: "28" }
+          - { os: windows-latest, elixir: "1.19", otp: "28" }
+    steps:
+      # Fixtures and doctests expect the line endings stored in the repository.
+      - name: Keep LF line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-${{ matrix.elixir }}-${{ matrix.otp }}-
+
+      - run: mix deps.get
+
+      # priv/native is a git-ignored build output that the cache does not hold, so a restored
+      # _build would look up to date and skip building the NIF. Rebuild the project app.
+      - name: Drop cached project build
+        shell: bash
+        run: rm -rf _build/test/lib/networkex
+
+      - name: Check formatting
+        if: matrix.lint
+        run: mix format --check-formatted
+
+      - run: mix compile --warnings-as-errors
+
+      - name: Credo
+        if: matrix.lint
+        run: mix credo --strict
+
+      - run: mix test
+
+  package:
+    name: Package and docs
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.19"
+          otp-version: "28"
+
+      # `mix docs` compiles the project, NIF included.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache deps and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-dev-
+
+      - run: mix deps.get
+
+      - name: Check mix.lock for unused dependencies
+        run: mix deps.unlock --check-unused
+
+      # See the elixir job.
+      - name: Drop cached project build
+        run: rm -rf _build/dev/lib/networkex
+
+      # Broken references and missing modules in the docs fail the build.
+      - name: Docs
+        run: mix docs --warnings-as-errors
+
+      # Only `mix hex.publish` requires the precompiled NIF checksum file (see RELEASING.md), so
+      # building the package needs no opt-out.
+      - name: Build the Hex package
+        run: mix hex.build
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # The release workflow builds the NIF once per NIF version feature.
+      - name: Build each NIF version
+        run: |
+          cargo build -p networkex_native --locked --no-default-features --features nif_version_2_16
+          cargo build -p networkex_native --locked --no-default-features --features nif_version_2_17
+
+  rust-msrv:
+    name: Rust MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The minimum supported Rust version is the workspace `rust-version` in Cargo.toml.
+      - name: Read the MSRV
+        run: |
+          msrv=$(sed -n 's/^rust-version = "\([^"]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error file=Cargo.toml::Could not read rust-version"
+            exit 1
+          fi
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo test --workspace --locked

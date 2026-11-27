@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in Networkex does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here; follow the security policy (SECURITY.md) instead.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead, with any error message.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest code that shows the problem, for example with a few lines passed to `Networkex.Network.new/2`.
+      render: elixir
+    validations:
+      required: true
+  - type: textarea
+    id: spaghetti
+    attributes:
+      label: Comparison with spaghetti
+      description: If the result differs from spaghetti's, the spaghetti code and output, and the spaghetti version. Check docs/parity.md first; deliberate deviations are listed there.
+  - type: input
+    id: networkex-version
+    attributes:
+      label: Networkex version
+      placeholder: "0.3.0"
+    validations:
+      required: true
+  - type: input
+    id: elixir-otp
+    attributes:
+      label: Elixir and OTP versions
+      description: The output of `elixir --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: "Ubuntu 24.04, x86_64"
+    validations:
+      required: true
+  - type: dropdown
+    id: nif
+    attributes:
+      label: NIF
+      options:
+        - Precompiled (default)
+        - Built from source (NETWORKEX_BUILD=1)
+        - Not sure
+    validations:
+      required: true

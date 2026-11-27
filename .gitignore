@@ -1,0 +1,25 @@
+# Elixir
+/_build/
+/deps/
+/doc/
+/cover/
+*.ez
+erl_crash.dump
+.elixir_ls/
+.elixir-tools/
+/tmp/
+
+# Rust
+/target/
+/priv/native/
+
+# Python (oracle fixture generators)
+.venv/
+__pycache__/
+
+# Hex package tarballs
+*.tar
+
+# Precompiled NIF checksums: generated for a release and shipped in the Hex package, never
+# committed, so a checkout always builds the NIF from source (see RELEASING.md).
+/checksum-*.exs

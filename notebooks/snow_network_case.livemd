@@ -1,0 +1,326 @@
+# Use case: John Snow's cholera map on the streets of Soho
+
+## Setup
+
+> Networkex, GeoFrame and Spatex come from Hex. To use a local checkout of Networkex instead (to
+> try changes that are not released yet), set `NETWORKEX_PATH` to it before starting Livebook; a
+> checkout builds its NIF from source, which needs Rust. From the root of the checkout:
+>
+> ```
+> NETWORKEX_PATH=$PWD livebook server notebooks/snow_network_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> NETWORKEX_PATH=$PWD elixir scripts/run_livemd.exs notebooks/snow_network_case.livemd
+> ```
+>
+> Spanish version: `notebooks/es/caso_snow_red.livemd`.
+
+```elixir
+# NETWORKEX_PATH: a local checkout of Networkex to use instead of the Hex package. A checkout
+# builds its NIF from source, which needs Rustler.
+networkex =
+  case System.get_env("NETWORKEX_PATH") do
+    path when path in [nil, ""] -> [{:networkex, "~> 0.3"}]
+    path -> [{:networkex, path: Path.expand(path)}, {:rustler, "~> 0.38", runtime: false}]
+  end
+
+Mix.install(
+  networkex ++
+    [
+      {:geoframe, "~> 0.3.4"},
+      {:spatex, "~> 0.2.1"},
+      {:explorer, "~> 0.13"},
+      {:kino, "~> 0.19"},
+      {:kino_vega_lite, "~> 0.1"},
+      {:req, "~> 0.5"}
+    ]
+)
+```
+
+The data are in `notebooks/data`, next to this notebook in the repository. Opened from anywhere
+else, such as with "Run in Livebook" on HexDocs, the notebook downloads them once from the
+repository on GitHub, at the tag of the installed Networkex version.
+
+```elixir
+# A Shapefile layer is its .shp, .shx, .dbf and .prj files.
+shapefile = fn layer -> for ext <- ~w(shp shx dbf prj), do: "#{layer}.#{ext}" end
+
+data_dir = fn name, files ->
+  local = Path.join([__DIR__, "data", name])
+
+  if File.dir?(local) do
+    local
+  else
+    vsn = Application.spec(:networkex, :vsn)
+    repo = "https://raw.githubusercontent.com/CountlinkX-Solutions/networkex"
+    cache = Path.join([System.tmp_dir!(), "networkex-#{vsn}", name])
+    File.mkdir_p!(cache)
+
+    for file <- files, not File.exists?(Path.join(cache, file)) do
+      url = "#{repo}/v#{vsn}/notebooks/data/#{name}/#{file}"
+      %{body: body} = Req.get!(url, decode_body: false, http_errors: :raise)
+      File.write!(Path.join(cache, file), body)
+    end
+
+    cache
+  end
+end
+```
+
+## The question
+
+In the cholera outbreak of Soho, London, in 1854, John Snow argued that the deaths clustered around
+one public water pump, on Broad Street. His famous map, and most re-analyses of it, measure
+distances in a straight line. But people fetched water **walking along the streets**: a pump
+across a block of houses is further than it looks. Snow himself drew a line of equal walking
+distance between the Broad Street pump and its neighbours.
+
+Here we redo his argument along the street network of the digitised map (libpysal's `snow_maps`):
+
+1. Which pump is **nearest by walking**, for every death, and how does it compare with the
+   straight line?
+2. Are the deaths **clustered along the streets**?
+3. Which **streets** had the most deaths, and what are the walking **routes** to Broad Street?
+
+## 1. The streets, the deaths and the pumps
+
+The layers come in Web Mercator; GeoFrame reprojects them to the British National Grid
+(EPSG:27700), in meters.
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias GeoFrame.GeoSeries, as: GS
+alias Networkex.Network
+
+dir = data_dir.("snow", Enum.flat_map(~w(Soho_Network SohoPeople SohoWater), shapefile))
+read = fn name -> dir |> Path.join(name) |> GeoFrame.read_file!() |> GDF.to_crs("EPSG:27700") end
+
+streets = read.("Soho_Network.shp")
+deaths = read.("SohoPeople.shp")
+pumps = read.("SohoWater.shp")
+crs = GDF.crs(streets)
+
+# Count is the number of deaths at each address; 0 stands for one (see the Spatex Snow case).
+deaths_at = deaths |> GDF.pull("Count") |> S.to_list() |> Enum.map(&max(&1, 1))
+
+raw = Networkex.GeoFrame.network(streets)
+
+%{
+  addresses: GDF.n_rows(deaths),
+  deaths: Enum.sum(deaths_at),
+  pumps: GDF.n_rows(pumps),
+  raw_components: raw.network.n_components
+}
+```
+
+### Cleaning the digitised streets
+
+A network needs streets that meet at shared vertices. The digitised map does not always have them:
+some streets cross others with no vertex at the crossing, and some stop a few meters short of the
+street they join. As digitised, the network falls into 45 pieces, and 93 of the 324 addresses
+cannot reach any pump along the streets.
+
+GeoFrame fixes both with standard topology cleaning: `snap/3` moves line ends that are within 5 m
+of another street onto it, and `union_all/1` nodes the lines (splits them where they cross);
+`explode/1` turns the result back into single lines.
+
+```elixir
+geometry = GDF.geometry(streets)
+{clean_lines, _} = geometry |> GS.snap(GS.union_all(geometry), 5) |> GS.union_all() |> GS.explode()
+
+ntw = Networkex.GeoFrame.network(clean_lines)
+
+%{
+  raw: %{components: raw.network.n_components, km: Enum.sum(raw.arc_lengths) / 1000},
+  cleaned: %{components: ntw.network.n_components, arcs: length(ntw.arcs), km: Enum.sum(ntw.arc_lengths) / 1000}
+}
+```
+
+After cleaning, the 324 addresses (583 deaths) and 13 pumps sit on a single connected network of
+348 arcs and 13.9 km, the same length as the digitised streets: the cleaning only joined them.
+
+The Broad Street pump, by its historical location (51.5133 N, 0.1367 W):
+
+```elixir
+xy = fn gdf ->
+  c = gdf |> GDF.geometry() |> GS.get_coordinates()
+  Enum.zip(S.to_list(c["x"]), S.to_list(c["y"]))
+end
+
+[historical] =
+  DF.new(name: ["Broad Street pump"])
+  |> GDF.new(GS.from_wkt!(["POINT(-0.13667 51.51334)"], crs: "EPSG:4326"))
+  |> GDF.to_crs("EPSG:27700")
+  |> xy.()
+
+straight = fn {x1, y1}, {x2, y2} -> :math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2) end
+wells = xy.(pumps)
+broad = wells |> Enum.with_index() |> Enum.min_by(fn {w, _} -> straight.(w, historical) end) |> elem(1)
+
+%{broad_street_pump: broad, meters_from_historical_location: straight.(Enum.at(wells, broad), historical)}
+```
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, crs: crs), color: {90, 90, 90}, width: 2, tooltip: ["arc", "length"])
+```
+
+## 2. The nearest pump, walking
+
+Every address and pump is snapped to its street; then the walking distance from every address to
+every pump.
+
+```elixir
+death_pp = Networkex.GeoFrame.snap(ntw, deaths)
+pump_pp = Networkex.GeoFrame.snap(ntw, pumps)
+
+walk = Network.nearest_neighbor_distances(ntw, death_pp, pump_pp)
+walk_pump = Enum.map(walk, fn {[p | _], _} -> p end)
+
+line_pump =
+  for a <- xy.(deaths) do
+    wells |> Enum.with_index() |> Enum.min_by(fn {w, _} -> straight.(a, w) end) |> elem(1)
+  end
+
+share = fn pumps_of ->
+  broad_deaths = Enum.zip(pumps_of, deaths_at) |> Enum.filter(fn {p, _} -> p == broad end) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+  broad_deaths / Enum.sum(deaths_at)
+end
+
+%{
+  deaths_nearest_broad_walking: share.(walk_pump),
+  deaths_nearest_broad_straight: share.(line_pump),
+  addresses_changing_pump: Enum.count(Enum.zip(walk_pump, line_pump), fn {a, b} -> a != b end),
+  mean_walk_m: walk |> Enum.map(&elem(&1, 1)) |> Enum.sum() |> Kernel./(length(walk))
+}
+```
+
+Walking, 63% of the deaths are nearer the Broad Street pump than any other (62% in a straight
+line). For 53 of the 324 addresses the nearest pump changes when distances are walked: the street
+layout matters address by address, and on the whole it makes Snow's case slightly stronger. The
+average walk to the nearest pump is about 130 m.
+
+```elixir
+deaths = GDF.put(deaths, "walking_pump", S.from_list(Enum.map(walk_pump, &"pump #{&1}")))
+GeoFrame.Kino.deck(deaths, color: {"walking_pump", :categorical}, radius: 4, tooltip: ["Count", "walking_pump"])
+```
+
+Deaths by the pump nearest on foot:
+
+```elixir
+DF.new(pump: walk_pump, deaths: deaths_at)
+|> DF.group_by("pump")
+|> DF.summarise(deaths: sum(deaths), addresses: count(deaths))
+|> DF.sort_by(desc: deaths)
+```
+
+The Broad Street pump (number 8) gathers 370 of the 583 deaths; the next one, 72.
+
+## 3. Clustered along the streets?
+
+The network K-function of the death addresses, against 99 random patterns of as many addresses
+along the same streets:
+
+```elixir
+k = Network.global_auto_k(ntw, death_pp, nsteps: 20, permutations: 99, seed: 3, threshold: 0.05)
+
+curves =
+  for {r, obs, lo, hi} <- Enum.zip([k.xaxis, k.observed, k.lower_envelope, k.upper_envelope]),
+      {name, v} <- [observed: obs, lower: lo, upper: hi],
+      do: %{distance_m: r, curve: Atom.to_string(name), k: v}
+
+VegaLite.new(width: 520, height: 300, title: "Network K of the death addresses")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "distance_m", type: :quantitative, title: "walking distance (m)")
+|> VegaLite.encode_field(:y, "k", type: :quantitative, title: "K(r)")
+|> VegaLite.encode_field(:color, "curve", type: :nominal)
+```
+
+```elixir
+above =
+  Enum.zip([k.xaxis, k.observed, k.upper_envelope])
+  |> Enum.filter(fn {_r, obs, up} -> obs > up end)
+  |> Enum.map(fn {r, _, _} -> round(r) end)
+
+%{distances_above_envelope_m: above}
+```
+
+The observed curve is above the envelope at every walking distance up to almost 900 m: the deaths
+are far more concentrated along the streets than addresses spread at random over the same streets
+would be.
+
+## 4. Deaths per street
+
+Deaths per street piece (at most 50 m long), weighted by the deaths at each address, and Moran's I
+of those counts with network contiguity:
+
+```elixir
+split = Network.split_arcs(ntw, 50)
+split_pp = Networkex.GeoFrame.snap(split, deaths)
+index = split.arcs |> Enum.with_index() |> Map.new()
+
+per_piece =
+  Enum.zip(split_pp.arcs, deaths_at)
+  |> Enum.reduce(List.duplicate(0, length(split.arcs)), fn {arc, d}, acc -> List.update_at(acc, index[arc], &(&1 + d)) end)
+
+w = Network.contiguity_weights(split)
+graph = Spatex.Graph.from_arrays(w.focal, w.neighbor, w.weight, ids: Enum.to_list(0..(w.n - 1)))
+moran = Spatex.ESDA.moran(per_piece, graph, permutations: 999, seed: 1)
+
+%{pieces: length(split.arcs), with_deaths: Enum.count(per_piece, &(&1 > 0)), moran_i: moran.i, expected: moran.ei, p_sim: moran.p_sim}
+```
+
+120 of the 479 pieces had deaths. Moran's I is 0.33 (expected -0.002, pseudo p-value 0.001):
+streets with many deaths are next to streets with many deaths, a cluster of streets around the
+pump rather than scattered cases.
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(split, columns: %{"deaths" => per_piece}, crs: crs),
+  color: {"deaths", :viridis},
+  width: "deaths",
+  tooltip: ["deaths"]
+)
+```
+
+## 5. Walking to Broad Street
+
+The routes from the ten addresses with the most deaths to the Broad Street pump:
+
+```elixir
+top = deaths_at |> Enum.with_index() |> Enum.sort_by(fn {d, _} -> -d end) |> Enum.take(10) |> Enum.map(&elem(&1, 1))
+
+pick = fn pp, idx ->
+  take = fn list -> Enum.map(idx, &Enum.at(list, &1)) end
+  %{pp | points: take.(pp.points), snapped: take.(pp.snapped), arcs: take.(pp.arcs), dist_to_vertex: take.(pp.dist_to_vertex), dist_snapped: take.(pp.dist_snapped)}
+end
+
+routes =
+  ntw
+  |> Network.shortest_paths(pick.(death_pp, top), pick.(pump_pp, [broad]))
+  |> Enum.map(fn %{pair: {i, _}} = p -> %{p | pair: {Enum.at(top, i), broad}} end)
+
+paths = Networkex.GeoFrame.paths(routes, crs: crs)
+
+DF.new(%{address: Enum.map(routes, &elem(&1.pair, 0)), deaths: Enum.map(top, &Enum.at(deaths_at, &1)), walk_m: S.to_list(GDF.pull(paths, "length"))})
+```
+
+```elixir
+GeoFrame.Kino.deck(paths, color: {200, 40, 40}, width: 4, tooltip: ["source", "length"])
+```
+
+The worst-hit addresses are between 14 and 250 m from the pump on foot.
+
+## What we learned
+
+* The digitised streets need topology cleaning (snapping ends within 5 m and noding crossings)
+  before they form a network; GeoFrame does it in three calls, without changing their length.
+* Measured on foot, 63% of the deaths are nearest the Broad Street pump, slightly more than in a
+  straight line, and the walking distance changes the nearest pump for one address in six.
+* The deaths are clustered along the streets (network K-function) and concentrated on neighbouring
+  streets (Moran's I 0.33): Snow's conclusion, about where people walked for water, holds on the
+  street network.

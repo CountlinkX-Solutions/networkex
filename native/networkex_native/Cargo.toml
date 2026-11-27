@@ -1,0 +1,26 @@
+[package]
+name = "networkex_native"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+# NIF symbols (enif_*) only resolve inside the BEAM, so this crate has no Rust tests;
+# logic and its tests live in networkex_core.
+test = false
+doctest = false
+
+[dependencies]
+networkex_core = { path = "../networkex_core" }
+rustler = { version = "0.39.0", default-features = false }
+
+# One feature per NIF version in Networkex.Native's `nif_versions`. The release workflow
+# (philss/rustler-precompiled-action) selects them by the name `nif_version_MAJOR_MINOR`.
+# The default is the oldest of them, so a source build loads on every supported OTP release.
+[features]
+default = ["nif_version_2_16"]
+nif_version_2_16 = ["rustler/nif_version_2_16"]
+nif_version_2_17 = ["rustler/nif_version_2_17"]

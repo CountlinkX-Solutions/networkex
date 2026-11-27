@@ -1,0 +1,13 @@
+[package]
+name = "networkex_core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+# Apache-2.0, with portions derived from CPython (src/hypot.rs, PSF-2.0) and from spaghetti
+# (BSD-3-Clause); see NOTICE.
+license = "Apache-2.0 AND PSF-2.0 AND BSD-3-Clause"
+publish = false
+
+[dependencies]
+geo-traits = "0.3"
+wkb = "0.9"

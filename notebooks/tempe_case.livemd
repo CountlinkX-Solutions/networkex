@@ -1,0 +1,311 @@
+# Use case: crime along the streets of Tempe, Arizona
+
+## Setup
+
+> Networkex, GeoFrame and Spatex come from Hex. To use a local checkout of Networkex instead (to
+> try changes that are not released yet), set `NETWORKEX_PATH` to it before starting Livebook; a
+> checkout builds its NIF from source, which needs Rust. From the root of the checkout:
+>
+> ```
+> NETWORKEX_PATH=$PWD livebook server notebooks/tempe_case.livemd
+> ```
+>
+> or headlessly, to check that every cell works:
+>
+> ```
+> NETWORKEX_PATH=$PWD elixir scripts/run_livemd.exs notebooks/tempe_case.livemd
+> ```
+>
+> Spanish version: `notebooks/es/caso_tempe.livemd`.
+
+```elixir
+# NETWORKEX_PATH: a local checkout of Networkex to use instead of the Hex package. A checkout
+# builds its NIF from source, which needs Rustler.
+networkex =
+  case System.get_env("NETWORKEX_PATH") do
+    path when path in [nil, ""] -> [{:networkex, "~> 0.3"}]
+    path -> [{:networkex, path: Path.expand(path)}, {:rustler, "~> 0.38", runtime: false}]
+  end
+
+Mix.install(
+  networkex ++
+    [
+      {:geoframe, "~> 0.3.4"},
+      {:spatex, "~> 0.2.1"},
+      {:explorer, "~> 0.13"},
+      {:kino, "~> 0.19"},
+      {:kino_vega_lite, "~> 0.1"},
+      {:req, "~> 0.5"}
+    ]
+)
+```
+
+The data are in `notebooks/data`, next to this notebook in the repository. Opened from anywhere
+else, such as with "Run in Livebook" on HexDocs, the notebook downloads them once from the
+repository on GitHub, at the tag of the installed Networkex version.
+
+```elixir
+# A Shapefile layer is its .shp, .shx, .dbf and .prj files.
+shapefile = fn layer -> for ext <- ~w(shp shx dbf prj), do: "#{layer}.#{ext}" end
+
+data_dir = fn name, files ->
+  local = Path.join([__DIR__, "data", name])
+
+  if File.dir?(local) do
+    local
+  else
+    vsn = Application.spec(:networkex, :vsn)
+    repo = "https://raw.githubusercontent.com/CountlinkX-Solutions/networkex"
+    cache = Path.join([System.tmp_dir!(), "networkex-#{vsn}", name])
+    File.mkdir_p!(cache)
+
+    for file <- files, not File.exists?(Path.join(cache, file)) do
+      url = "#{repo}/v#{vsn}/notebooks/data/#{name}/#{file}"
+      %{body: body} = Req.get!(url, decode_body: false, http_errors: :raise)
+      File.write!(Path.join(cache, file), body)
+    end
+
+    cache
+  end
+end
+```
+
+## The question
+
+Crime happens on streets. A map of incidents invites the usual questions (are they clustered?
+how far are they from schools?), but measuring them "as the crow flies" ignores that people,
+cars and patrols move along the street network: two incidents on either side of a block may be
+far apart for anyone on foot. Network analysis measures along the streets instead.
+
+The data are the spaghetti tutorials' Tempe, Arizona sample (distributed with PySAL): 293 street
+lines, 287 crimes and 8 schools, in StatePlane Arizona Central (US feet). We ask:
+
+1. What does the street **network** look like (segments, intersections, connectivity)?
+2. How far is each crime from the **nearest school**, along the streets?
+3. Are crimes **clustered along the network**, beyond what streets alone would produce?
+4. Do streets with many crimes neighbour streets with many crimes (**spatial autocorrelation**)?
+5. Which **routes** lead from the crimes to their nearest school?
+
+## 1. The street network
+
+```elixir
+require Explorer.DataFrame, as: DF
+alias Explorer.Series, as: S
+alias GeoFrame.GeoDataFrame, as: GDF
+alias Networkex.Network
+
+dir = data_dir.("geodanet", Enum.flat_map(~w(streets crimes schools), shapefile))
+
+# The layers carry the CRS of their .prj files, StatePlane Arizona Central (NAD 1983) in US
+# feet, so every distance below is in US feet.
+read = fn name -> dir |> Path.join(name) |> GeoFrame.read_file!() end
+
+streets = read.("streets.shp")
+crimes = read.("crimes.shp")
+schools = read.("schools.shp")
+crs = GDF.crs(streets)
+
+{GDF.n_rows(streets), GDF.n_rows(crimes), GDF.n_rows(schools)}
+```
+
+`Networkex.GeoFrame.network/2` turns every line into **arcs** between consecutive vertices, and
+joins lines that meet at the same (rounded) point. The **graph** merges every chain of
+degree-2 vertices into one **edge**, from intersection to intersection.
+
+```elixir
+ntw = Networkex.GeoFrame.network(streets)
+
+%{
+  vertices: length(ntw.vertices),
+  arcs: length(ntw.arcs),
+  graph_edges: length(ntw.graph.edges),
+  components: ntw.network.n_components,
+  total_length_miles: Enum.sum(ntw.arc_lengths) / 5280
+}
+```
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, crs: crs),
+  color: {"length", :viridis},
+  tooltip: ["arc", "length"]
+)
+```
+
+## 2. Crimes and schools on the network
+
+Each observation is **snapped** to the nearest point of its nearest street segment. The snapping
+distance says how far the recorded location lies from the street.
+
+```elixir
+crime_pp = Networkex.GeoFrame.snap(ntw, crimes)
+school_pp = Networkex.GeoFrame.snap(ntw, schools)
+
+snap = S.from_list(crime_pp.dist_snapped)
+%{max_snap_ft: S.max(snap), mean_snap_ft: S.mean(snap)}
+```
+
+The network distance from each crime to its nearest school, next to the straight-line distance:
+the ratio tells how much longer the trip along the streets is.
+
+```elixir
+nearest = Network.nearest_neighbor_distances(ntw, crime_pp, school_pp)
+
+straight = fn {x1, y1}, {x2, y2} -> :math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) end
+
+table =
+  Enum.zip(crime_pp.snapped, nearest)
+  |> Enum.with_index()
+  |> Enum.map(fn {{p, {[school | _], network_ft}}, i} ->
+    euclid = straight.(p, Enum.at(school_pp.snapped, school))
+    %{crime: i, school: school, network_ft: network_ft, straight_ft: euclid, ratio: network_ft / euclid}
+  end)
+  |> DF.new()
+
+DF.summarise(table, mean_network_ft: mean(network_ft), mean_ratio: mean(ratio), max_ratio: max(ratio))
+```
+
+```elixir
+school_of = table |> DF.pull("school") |> S.to_list()
+
+GeoFrame.Kino.deck(Networkex.GeoFrame.points(crime_pp, columns: %{"nearest_school" => school_of}, crs: crs),
+  color: {"nearest_school", :categorical},
+  radius: 4,
+  tooltip: ["nearest_school", "snap_distance"]
+)
+```
+
+## 3. Are crimes clustered along the streets?
+
+The global auto **K-function** counts, for growing distances `r`, how many pairs of crimes are
+closer than `r` along the network, relative to the crime intensity. It is compared with the same
+curve for random patterns of as many points spread uniformly along the streets: if the observed
+curve rises above the simulation envelope, crimes are closer to each other than the street layout
+alone explains.
+
+```elixir
+k = Network.global_auto_k(ntw, crime_pp, nsteps: 20, permutations: 99, seed: 7, threshold: 0.05)
+
+curves =
+  for {r, obs, lo, hi} <- Enum.zip([k.xaxis, k.observed, k.lower_envelope, k.upper_envelope]),
+      {name, v} <- [observed: obs, lower: lo, upper: hi],
+      do: %{distance_ft: r, curve: Atom.to_string(name), k: v}
+
+VegaLite.new(width: 520, height: 300, title: "Global auto K along the network")
+|> VegaLite.data_from_values(curves)
+|> VegaLite.mark(:line)
+|> VegaLite.encode_field(:x, "distance_ft", type: :quantitative, title: "distance (ft)")
+|> VegaLite.encode_field(:y, "k", type: :quantitative, title: "K(r)")
+|> VegaLite.encode_field(:color, "curve", type: :nominal)
+```
+
+```elixir
+above =
+  Enum.zip([k.xaxis, k.observed, k.upper_envelope])
+  |> Enum.filter(fn {_r, obs, up} -> obs > up end)
+  |> Enum.map(fn {r, _, _} -> round(r) end)
+
+%{distances_above_envelope_ft: above}
+```
+
+spaghetti's envelope scales the extreme simulated values (by `1 - threshold / 2` and
+`threshold / 2`); `threshold: 0.05` keeps them almost as they are. The observed curve is above
+the envelope from about 500 feet up to a little over 3000 feet, and again from about 6400 feet:
+crimes are closer to each other along the streets than 287 random points on the same streets
+would be, at block scale and at the scale of the whole area.
+
+## 4. Crimes per street and spatial autocorrelation
+
+Counting crimes per arc gives a value per street segment. Two segments are neighbours when they
+share a vertex. Moran's I (from Spatex, on Networkex's contiguity weights) then asks whether
+segments with many crimes sit next to each other.
+
+```elixir
+counts = Network.counts_per_link(ntw, crime_pp)
+w = Network.contiguity_weights(ntw)
+graph = Spatex.Graph.from_arrays(w.focal, w.neighbor, w.weight, ids: Enum.to_list(0..(w.n - 1)))
+moran = Spatex.ESDA.moran(counts, graph, permutations: 999, seed: 1)
+
+%{moran_i: moran.i, expected: moran.ei, p_sim: moran.p_sim}
+```
+
+Moran's I is about 0.005, against an expected -0.003, with a pseudo p-value around 0.3: no
+evidence that segments with many crimes are next to segments with many crimes. The clustering
+found by the K-function is a matter of crimes being near one another, not of whole groups of
+neighbouring streets standing out.
+
+```elixir
+GeoFrame.Kino.deck(Networkex.GeoFrame.arcs(ntw, columns: %{"crimes" => counts}, crs: crs),
+  color: {"crimes", :viridis},
+  width: "crimes",
+  tooltip: ["arc", "crimes", "length"]
+)
+```
+
+Arcs are as long as the digitised segments, so a long arc collects more crimes just by its length.
+Splitting the network into pieces of at most 500 feet makes the units comparable; the crimes
+are snapped again to the split network.
+
+```elixir
+split = Network.split_arcs(ntw, 500)
+split_pp = Networkex.GeoFrame.snap(split, crimes)
+split_counts = Network.counts_per_link(split, split_pp)
+sw = Network.contiguity_weights(split)
+
+split_moran =
+  Spatex.ESDA.moran(
+    split_counts,
+    Spatex.Graph.from_arrays(sw.focal, sw.neighbor, sw.weight, ids: Enum.to_list(0..(sw.n - 1))),
+    permutations: 999,
+    seed: 1
+  )
+
+%{arcs: length(split.arcs), moran_i: split_moran.i, p_sim: split_moran.p_sim}
+```
+
+## 5. Routes to the nearest school
+
+The shortest path from a few crimes to their nearest school, along the streets:
+
+```elixir
+picked = [0, 50, 100, 150, 200]
+
+routes =
+  for i <- picked do
+    one = %{
+      crime_pp
+      | points: [Enum.at(crime_pp.points, i)],
+        snapped: [Enum.at(crime_pp.snapped, i)],
+        arcs: [Enum.at(crime_pp.arcs, i)],
+        dist_to_vertex: [Enum.at(crime_pp.dist_to_vertex, i)],
+        dist_snapped: [Enum.at(crime_pp.dist_snapped, i)]
+    }
+
+    school = Enum.at(school_of, i)
+    Network.shortest_paths(ntw, one, school_pp) |> Enum.at(school) |> Map.put(:pair, {i, school})
+  end
+
+paths = Networkex.GeoFrame.paths(routes, crs: crs)
+DF.new(%{crime: Enum.map(routes, &elem(&1.pair, 0)), school: Enum.map(routes, &elem(&1.pair, 1)), length_ft: S.to_list(GDF.pull(paths, "length"))})
+```
+
+```elixir
+GeoFrame.Kino.deck(paths, color: {"dest", :categorical}, width: 4, tooltip: ["source", "dest", "length"])
+```
+
+The path lengths agree with the network distances of section 2 to about a millionth of a percent
+(the arc lengths run from each rounded vertex to the next vertex as digitised, the paths join the
+rounded vertices): the path is the route those distances measure.
+
+## What we learned
+
+* The 293 street lines form one connected network of 230 vertices and 303 arcs (179 edges between
+  intersections), about 19.8 miles of streets.
+* Recorded crime locations lie on average 90 feet from the street (at most 326). Along the streets
+  the nearest school is on average 1500 feet away, a third more than in a straight line, and up to
+  2.6 times the straight distance.
+* The network K-function shows crimes clustered along the streets beyond what the street layout
+  explains, both at short distances and over the whole area.
+* Counts per segment show no spatial autocorrelation by network contiguity (Moran's I near its
+  expectation), also with segments split to at most 500 feet.
+
+Every Networkex function used here is verified against spaghetti (see the parity guide).
